@@ -1,18 +1,19 @@
-# -*- encoding: utf-8 -*-
-
+# -*- coding: utf-8 -*-
 import glob
 import logging
 import re
 
-import openerp
-from openerp.tools import ustr
+from odoo import models, api
+from odoo.tools import ustr
 
 _logger = logging.getLogger(__name__)
 
-class runbot_build(openerp.models.Model):
+
+class RunbotBuild(models.Model):
     _inherit = "runbot.build"
 
-    def job_05_check_cla(self, cr, uid, build, lock_path, log_path):
+    @api.model
+    def job_05_check_cla(self, build, lock_path, log_path):
         cla_glob = glob.glob(build.path("doc/cla/*/*.md"))
         if cla_glob:
             cla = ''.join(open(f).read() for f in cla_glob)

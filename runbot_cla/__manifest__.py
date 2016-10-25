@@ -3,9 +3,9 @@
     'name': 'Runbot CLA',
     'category': 'Website',
     'summary': 'Runbot CLA',
-    'version': '1.1',
+    'version': '1.2',
     'description': "Runbot CLA",
-    'author': 'Odoo SA',
+    'author': 'Odoo S.A.',
     'depends': ['runbot'],
-    'data': [ ],
+    'data': [],
 }
