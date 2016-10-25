@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 {
     'name': 'Runbot CLA',
     'category': 'Website',
