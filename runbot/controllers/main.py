@@ -10,37 +10,29 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.textpath import TextToPath
 import werkzeug
 
-import openerp
-from openerp import http, SUPERUSER_ID
-from openerp.http import request
-from openerp.osv import osv
-from openerp.addons.website.models.website import slug
-from openerp.addons.website_sale.controllers.main import QueryURL
+from odoo import http
+from odoo.http import request
+# from openerp.addons.website.models.website import slug
+# from openerp.addons.website_sale.controllers.main import QueryURL
 
 _logger = logging.getLogger(__name__)
 
 
-#----------------------------------------------------------
-# RunBot helpers
-#----------------------------------------------------------
-
 def s2human(time):
     """Convert a time in second into an human readable string"""
-    for delay, desc in [(86400,'d'),(3600,'h'),(60,'m')]:
+    for delay, desc in [(86400, 'd'), (3600, 'h'), (60, 'm')]:
         if time >= delay:
             return str(int(time / delay)) + desc
     return str(int(time)) + "s"
 
+
 def flatten(list_of_lists):
     return list(itertools.chain.from_iterable(list_of_lists))
+
 
 def uniq_list(l):
     return OrderedDict.fromkeys(l).keys()
 
-
-#----------------------------------------------------------
-# Runbot Controller
-#----------------------------------------------------------
 
 class RunbotController(http.Controller):
 
@@ -50,7 +42,6 @@ class RunbotController(http.Controller):
 
         branch_obj = registry['runbot.branch']
         build_obj = registry['runbot.build']
-        icp = registry['ir.config_parameter']
         repo_obj = registry['runbot.repo']
         count = lambda dom: build_obj.search_count(cr, uid, dom)
 
@@ -393,4 +384,3 @@ class RunbotController(http.Controller):
         else:
             return request.not_found()
         return werkzeug.utils.redirect(url)
-

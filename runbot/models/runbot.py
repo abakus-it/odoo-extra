@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-
 import contextlib
 import datetime
 import fcntl
 import glob
 import hashlib
 import itertools
+import json
 import logging
 import operator
 import os
@@ -14,7 +14,6 @@ import re
 import resource
 import shutil
 import signal
-import simplejson
 import socket
 import subprocess
 import sys
@@ -28,37 +27,29 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.textpath import TextToPath
 import werkzeug
 
-import openerp
-from openerp import http, SUPERUSER_ID
-from openerp.http import request
-from openerp.osv import fields, osv
-from openerp.tools import config, appdirs
-from openerp.addons.website.models.website import slug
-from openerp.addons.website_sale.controllers.main import QueryURL
+# from openerp.tools import config, appdirs
+from odoo import models, fields, api
+
 
 _logger = logging.getLogger(__name__)
 
-#----------------------------------------------------------
-# Runbot Const
-#----------------------------------------------------------
 
-_re_error = r'^(?:\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \d+ (?:ERROR|CRITICAL) )|(?:Traceback \(most recent call last\):)$'
-_re_warning = r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \d+ WARNING '
-_re_job = re.compile('job_\d')
+_RE_ERROR = r'^(?:\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \d+ (?:ERROR|CRITICAL) )|(?:Traceback \(most recent call last\):)$'
+_RE_WARNING = r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \d+ WARNING '
+_RE_JOB = re.compile('job_\d')
+
 
 # increase cron frequency from 0.016 Hz to 0.1 Hz to reduce starvation and improve throughput with many workers
 # TODO: find a nicer way than monkey patch to accomplish this
-openerp.service.server.SLEEP_INTERVAL = 10
-openerp.addons.base.ir.ir_cron._intervalTypes['minutes'] = lambda interval: relativedelta(seconds=interval*10)
+odoo.service.server.SLEEP_INTERVAL = 10
+odoo.addons.base.ir.ir_cron._intervalTypes['minutes'] = lambda interval: relativedelta(seconds=interval * 10)
 
-#----------------------------------------------------------
-# RunBot helpers
-#----------------------------------------------------------
 
 def log(*l, **kw):
     out = [i if isinstance(i, basestring) else repr(i) for i in l] + \
           ["%s=%r" % (k, v) for k, v in kw.items()]
     _logger.debug(' '.join(out))
+
 
 def dashes(string):
     """Sanitize the input string"""
@@ -68,15 +59,18 @@ def dashes(string):
         string = string.replace(i, "-")
     return string
 
+
 def mkdirs(dirs):
     for d in dirs:
         if not os.path.exists(d):
             os.makedirs(d)
 
+
 def grep(filename, string):
     if os.path.isfile(filename):
         return open(filename).read().find(string) != -1
     return False
+
 
 def rfind(filename, pattern):
     """Determine in something in filename matches the pattern"""
@@ -87,9 +81,11 @@ def rfind(filename, pattern):
                 return True
     return False
 
+
 def lock(filename):
     fd = os.open(filename, os.O_CREAT | os.O_RDWR, 0600)
     fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
 
 def locked(filename):
     result = False
@@ -104,8 +100,6 @@ def locked(filename):
         result = False
     return result
 
-def nowait():
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
 def run(l, env=None):
     """Run a command described by l in environment env"""
@@ -125,22 +119,15 @@ def run(l, env=None):
     log("run", rc=rc)
     return rc
 
+
 def now():
     return time.strftime(openerp.tools.DEFAULT_SERVER_DATETIME_FORMAT)
+
 
 def dt2time(datetime):
     """Convert datetime to time"""
     return time.mktime(time.strptime(datetime, openerp.tools.DEFAULT_SERVER_DATETIME_FORMAT))
 
-def s2human(time):
-    """Convert a time in second into an human readable string"""
-    for delay, desc in [(86400,'d'),(3600,'h'),(60,'m')]:
-        if time >= delay:
-            return str(int(time / delay)) + desc
-    return str(int(time)) + "s"
-
-def flatten(list_of_lists):
-    return list(itertools.chain.from_iterable(list_of_lists))
 
 def decode_utf(field):
     try:
@@ -148,106 +135,107 @@ def decode_utf(field):
     except UnicodeDecodeError:
         return ''
 
+
 def uniq_list(l):
     return OrderedDict.fromkeys(l).keys()
 
+
 def fqdn():
     return socket.getfqdn()
+
 
 @contextlib.contextmanager
 def local_pgadmin_cursor():
     cnx = None
     try:
         cnx = psycopg2.connect("dbname=postgres")
-        cnx.autocommit = True # required for admin commands
+        cnx.autocommit = True  # required for admin commands
         yield cnx.cursor()
     finally:
-        if cnx: cnx.close()
+        if cnx:
+            cnx.close()
 
-#----------------------------------------------------------
+
+# ----------------------------------------------------------
 # RunBot Models
-#----------------------------------------------------------
+# ----------------------------------------------------------
 
-class runbot_repo(osv.osv):
-    _name = "runbot.repo"
+class RunbotRepo(models.Model):
+    _name = 'runbot.repo'
     _order = 'id'
 
-    def _get_path(self, cr, uid, ids, field_name, arg, context=None):
-        root = self.root(cr, uid)
-        result = {}
-        for repo in self.browse(cr, uid, ids, context=context):
+    name = fields.Char('Repository', required=True)
+    path = fields.Char(compute='_compute_path', string='Directory')
+
+    @api.multi
+    def _compute_path(self):
+        root = self.root()
+        for repo in self:
             name = repo.name
             for i in '@:/':
                 name = name.replace(i, '_')
-            result[repo.id] = os.path.join(root, 'repo', name)
-        return result
+            repo.path = os.path.join(root, 'repo', name)
 
-    def _get_base(self, cr, uid, ids, field_name, arg, context=None):
-        result = {}
-        for repo in self.browse(cr, uid, ids, context=context):
+    base = fields.Char(compute='_compute_base', string='Base URL')
+
+    @api.multi
+    def _compute_base(self):
+        for repo in self:
             name = re.sub('.+@', '', repo.name)
             name = re.sub('.git$', '', name)
-            name = name.replace(':','/')
-            result[repo.id] = name
-        return result
+            name = name.replace(':', '/')
+            repo.base = name
 
-    _columns = {
-        'name': fields.char('Repository', required=True),
-        'path': fields.function(_get_path, type='char', string='Directory', readonly=1),
-        'base': fields.function(_get_base, type='char', string='Base URL', readonly=1),
-        'nginx': fields.boolean('Nginx'),
-        'mode': fields.selection([('disabled', 'Disabled'),
-                                  ('poll', 'Poll'),
-                                  ('hook', 'Hook')],
-                                  string="Mode", required=True, help="hook: Wait for webhook on /runbot/hook/<id> i.e. github push event"),
-        'hook_time': fields.datetime('Last hook time'),
-        'duplicate_id': fields.many2one('runbot.repo', 'Duplicate repo', help='Repository for finding duplicate builds'),
-        'modules': fields.char("Modules to install", help="Comma-separated list of modules to install and test."),
-        'modules_auto': fields.selection([('none', 'None (only explicit modules list)'),
-                                          ('repo', 'Repository modules (excluding dependencies)'),
-                                          ('all', 'All modules (including dependencies)')],
-                                         string="Other modules to install automatically"),
-        'dependency_ids': fields.many2many(
-            'runbot.repo', 'runbot_repo_dep_rel',
-            id1='dependant_id', id2='dependency_id',
-            string='Extra dependencies',
-            help="Community addon repos which need to be present to run tests."),
-        'token': fields.char("Github token"),
-        'group_ids': fields.many2many('res.groups', string='Limited to groups'),
-    }
-    _defaults = {
-        'mode': 'poll',
-        'modules_auto': 'repo',
-        'job_timeout': 30,
-    }
+    nginx = fields.Boolean('Nginx')
+    mode = fields.Selection([('disabled', 'Disabled'),
+                             ('poll', 'Poll'),
+                             ('hook', 'Hook')],
+                            string="Mode", required=True, default='mode',
+                            help="hook: Wait for webhook on /runbot/hook/<id> i.e. GitHub push event")
+    hook_time = fields.Datetime('Last hook time')
+    duplicate_id = fields.Many2one('runbot.repo', 'Duplicate repo', help='Repository for finding duplicate builds')
+    modules = fields.Char("Modules to install", help="Comma-separated list of modules to install and test")
+    modules_auto = fields.Selection([('none', 'None (only explicit modules list)'),
+                                     ('repo', 'Repository modules (excluding dependencies)'),
+                                     ('all', 'All modules (including dependencies)')],
+                                    default='repo',
+                                    string="Other modules to install automatically")
+    dependency_ids = fields.Many2many('runbot.repo', 'runbot_repo_dep_rel', id1='dependant_id', id2='dependency_id',
+                                      string='Extra dependencies', help="Community addon repos which need to be present to run tests.")
+    token = fields.Char("GitHub token")
+    group_ids = fields.Many2many('res.groups', string='Limited to groups')
 
-    def domain(self, cr, uid, context=None):
-        domain = self.pool.get('ir.config_parameter').get_param(cr, uid, 'runbot.domain', fqdn())
-        return domain
+    @api.model
+    def domain(self):
+        return self.env['ir.config_parameter'].get_param('runbot.domain', fqdn())
 
-    def root(self, cr, uid, context=None):
-        """Return root directory of repository"""
+    @api.model
+    def root(self):
+        """ Return root directory of repository """
         default = os.path.join(os.path.dirname(__file__), 'static')
-        return self.pool.get('ir.config_parameter').get_param(cr, uid, 'runbot.root', default)
+        return self.env['ir.config_parameter'].get_param('runbot.root', default)
 
-    def git(self, cr, uid, ids, cmd, context=None):
-        """Execute git command cmd"""
-        for repo in self.browse(cr, uid, ids, context=context):
+    @api.multi
+    def git(self, cmd):
+        """ Execute git command cmd """
+        for repo in self:
             cmd = ['git', '--git-dir=%s' % repo.path] + cmd
             _logger.info("git: %s", ' '.join(cmd))
             return subprocess.check_output(cmd)
 
-    def git_export(self, cr, uid, ids, treeish, dest, context=None):
-        for repo in self.browse(cr, uid, ids, context=context):
+    @api.multi
+    def git_export(self, treeish, dest):
+        for repo in self:
             _logger.debug('checkout %s %s %s', repo.name, treeish, dest)
             p1 = subprocess.Popen(['git', '--git-dir=%s' % repo.path, 'archive', treeish], stdout=subprocess.PIPE)
             p2 = subprocess.Popen(['tar', '-xmC', dest], stdin=p1.stdout, stdout=subprocess.PIPE)
             p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
             p2.communicate()[0]
 
-    def github(self, cr, uid, ids, url, payload=None, ignore_errors=False, context=None):
-        """Return a http request to be sent to github"""
-        for repo in self.browse(cr, uid, ids, context=context):
+    @api.multi
+    def github(self, url, payload=None, ignore_errors=False):
+        """Return a HTTP request to be sent to GitHub"""
+        for repo in self:
             if not repo.token:
                 return
             try:
@@ -255,31 +243,35 @@ class runbot_repo(osv.osv):
                 if match_object:
                     url = url.replace(':owner', match_object.group(2))
                     url = url.replace(':repo', match_object.group(3))
-                    url = 'https://api.%s%s' % (match_object.group(1),url)
+                    url = 'https://api.%s%s' % (match_object.group(1), url)
                     session = requests.Session()
-                    session.auth = (repo.token,'x-oauth-basic')
+                    session.auth = (repo.token, 'x-oauth-basic')
                     session.headers.update({'Accept': 'application/vnd.github.she-hulk-preview+json'})
                     if payload:
-                        response = session.post(url, data=simplejson.dumps(payload))
+                        response = session.post(url, data=json.dumps(payload))
                     else:
                         response = session.get(url)
                     response.raise_for_status()
                     return response.json()
             except Exception:
                 if ignore_errors:
-                    _logger.exception('Ignored github error %s %r', url, payload)
+                    _logger.exception('Ignored GitHub error %s %r', url, payload)
                 else:
                     raise
 
-    def update(self, cr, uid, ids, context=None):
-        for repo in self.browse(cr, uid, ids, context=context):
-            self.update_git(cr, uid, repo)
+    @api.multi
+    def update(self):
+        for repo in self:
+            self._update_git(repo)
 
-    def update_git(self, cr, uid, repo, context=None):
+    @api.model
+    # TODO merge with previous method
+    # TODO finish to migrate
+    def _update_git(self, repo):
         _logger.debug('repo %s updating branches', repo.name)
 
-        Build = self.pool['runbot.build']
-        Branch = self.pool['runbot.branch']
+        Build = self.env['runbot.build']
+        Branch = self.env['runbot.branch']
 
         if not os.path.isdir(os.path.join(repo.path)):
             os.makedirs(repo.path)
@@ -300,14 +292,14 @@ class runbot_repo(osv.osv):
         repo.git(['fetch', '-p', 'origin', '+refs/heads/*:refs/heads/*'])
         repo.git(['fetch', '-p', 'origin', '+refs/pull/*/head:refs/pull/*'])
 
-        fields = ['refname','objectname','committerdate:iso8601','authorname','authoremail','subject','committername','committeremail']
-        fmt = "%00".join(["%("+field+")" for field in fields])
+        fields = ['refname', 'objectname', 'committerdate:iso8601', 'authorname', 'authoremail', 'subject', 'committername', 'committeremail']
+        fmt = "%00".join(["%(" + field + ")" for field in fields])
         git_refs = repo.git(['for-each-ref', '--format', fmt, '--sort=-committerdate', 'refs/heads', 'refs/pull'])
         git_refs = git_refs.strip()
 
         refs = [[decode_utf(field) for field in line.split('\x00')] for line in git_refs.split('\n')]
 
-        cr.execute("""
+        self._cr.execute("""
             WITH t (branch) AS (SELECT unnest(%s))
           SELECT t.branch, b.id
             FROM t LEFT JOIN runbot_branch b ON (b.name = t.branch)
@@ -321,13 +313,13 @@ class runbot_repo(osv.osv):
                 branch_id = ref_branches[name]
             else:
                 _logger.debug('repo %s found new branch %s', repo.name, name)
-                branch_id = Branch.create(cr, uid, {'repo_id': repo.id, 'name': name})
-            branch = Branch.browse(cr, uid, [branch_id], context=context)[0]
+                branch_id = Branch.create({'repo_id': repo.id, 'name': name})
+            branch = Branch.browse([branch_id])[0]
             # skip build for old branches
             if dateutil.parser.parse(date[:19]) + datetime.timedelta(30) < datetime.datetime.now():
                 continue
             # create build (and mark previous builds as skipped) if not found
-            build_ids = Build.search(cr, uid, [('branch_id', '=', branch.id), ('name', '=', sha)])
+            build_ids = Build.search([('branch_id', '=', branch.id), ('name', '=', sha)])
             if not build_ids:
                 _logger.debug('repo %s branch %s new build found revno %s', branch.repo_id.name, branch.name, sha)
                 build_info = {
@@ -342,8 +334,8 @@ class runbot_repo(osv.osv):
                 }
 
                 if not branch.sticky:
-                    skipped_build_sequences = Build.search_read(cr, uid, [('branch_id', '=', branch.id), ('state', '=', 'pending')],
-                                                                fields=['sequence'], order='sequence asc', context=context)
+                    skipped_build_sequences = Build.search_read([('branch_id', '=', branch.id), ('state', '=', 'pending')],
+                                                                fields=['sequence'], order='sequence asc',)
                     if skipped_build_sequences:
                         to_be_skipped_ids = [build['id'] for build in skipped_build_sequences]
                         Build.skip(cr, uid, to_be_skipped_ids, context=context)
@@ -353,12 +345,13 @@ class runbot_repo(osv.osv):
 
         # skip old builds (if their sequence number is too low, they will not ever be built)
         skippable_domain = [('repo_id', '=', repo.id), ('state', '=', 'pending')]
-        icp = self.pool['ir.config_parameter']
-        running_max = int(icp.get_param(cr, uid, 'runbot.running_max', default=75))
-        to_be_skipped_ids = Build.search(cr, uid, skippable_domain, order='sequence desc', offset=running_max)
-        Build.skip(cr, uid, to_be_skipped_ids)
+        IrConfigParameter = self.env['ir.config_parameter']
+        running_max = int(IrConfigParameter.get_param(cr, uid, 'runbot.running_max', default=75))
+        to_be_skipped_ids = Build.search(skippable_domain, order='sequence desc', offset=running_max)
+        Build.skip(to_be_skipped_ids)
 
     def scheduler(self, cr, uid, ids=None, context=None):
+        # TODO migrate
         icp = self.pool['ir.config_parameter']
         workers = int(icp.get_param(cr, uid, 'runbot.workers', default=6))
         running_max = int(icp.get_param(cr, uid, 'runbot.running_max', default=75))
@@ -406,19 +399,18 @@ class runbot_repo(osv.osv):
         Build.kill(cr, uid, build_ids[running_max:])
         Build.reap(cr, uid, build_ids)
 
-    def reload_nginx(self, cr, uid, context=None):
+    @api.model
+    def reload_nginx(self):
         settings = {}
         settings['port'] = config['xmlrpc_port']
-        nginx_dir = os.path.join(self.root(cr, uid), 'nginx')
+        nginx_dir = os.path.join(self.root(), 'nginx')
         settings['nginx_dir'] = nginx_dir
-        ids = self.search(cr, uid, [('nginx','=',True)], order='id')
-        if ids:
-            build_ids = self.pool['runbot.build'].search(cr, uid, [('repo_id','in',ids), ('state','=','running')])
-            settings['builds'] = self.pool['runbot.build'].browse(cr, uid, build_ids)
-
-            nginx_config = self.pool['ir.ui.view'].render(cr, uid, "runbot.nginx_config", settings)
+        nginx_repos = self.search([('nginx', '=', True)], order='id')
+        if nginx_repos:
+            settings['builds'] = self.env['runbot.build'].search([('repo_id', 'in', nginx_repos), ('state', '=', 'running')])
+            nginx_config = self.env['ir.ui.view'].render("runbot.nginx_config", settings)
             mkdirs([nginx_dir])
-            open(os.path.join(nginx_dir, 'nginx.conf'),'w').write(nginx_config)
+            open(os.path.join(nginx_dir, 'nginx.conf'), 'w').write(nginx_config)
             try:
                 _logger.debug('reload nginx')
                 pid = int(open(os.path.join(nginx_dir, 'nginx.pid')).read().strip(' \n'))
@@ -433,72 +425,71 @@ class runbot_repo(osv.osv):
                     else:
                         _logger.debug('failed to start nginx - failed to kill orphan worker - oh well')
 
-    def killall(self, cr, uid, ids=None, context=None):
-        # kill switch
-        Build = self.pool['runbot.build']
-        build_ids = Build.search(cr, uid, [('state', 'not in', ['done', 'pending'])])
-        Build.kill(cr, uid, build_ids)
+    @api.model
+    def killall(self):
+        ''' Kill Switch '''
+        Build = self.env['runbot.build']
+        builds = Build.search([('state', 'not in', ['done', 'pending'])])
+        builds.kill()
 
-    def cron(self, cr, uid, ids=None, context=None):
-        ids = self.search(cr, uid, [('mode', '!=', 'disabled')], context=context)
-        self.update(cr, uid, ids, context=context)
-        self.scheduler(cr, uid, ids, context=context)
-        self.reload_nginx(cr, uid, context=context)
+    @api.multi
+    def _cron_repository(self):
+        repositories = self.search([('mode', '!=', 'disabled')])
+        repositories.update()
+        repositories.scheduler()
+        self.reload_nginx()
 
-class runbot_branch(osv.osv):
-    _name = "runbot.branch"
+
+class RunbotBranch(models.Model):
+    _name = 'runbot.branch'
     _order = 'name'
 
-    def _get_branch_name(self, cr, uid, ids, field_name, arg, context=None):
-        r = {}
-        for branch in self.browse(cr, uid, ids, context=context):
-            r[branch.id] = branch.name.split('/')[-1]
-        return r
+    repo_id = fields.Many2one('runbot.repo', 'Repository', required=True, ondelete='cascade', index=True)
+    name = fields.Char('Ref Name', required=True)
 
-    def _get_pull_head_name(self, cr, uid, ids, field_name, arg, context=None):
-        r = dict.fromkeys(ids, False)
-        for bid in ids:
-            pi = self._get_pull_info(cr, uid, [bid], context=context)
-            if pi:
-                r[bid] = pi['head']['ref']
-        return r
+    branch_name = fields.Char(compute='_compute_branch_name', string='Branch', store=True)
 
-    def _get_branch_url(self, cr, uid, ids, field_name, arg, context=None):
-        r = {}
-        for branch in self.browse(cr, uid, ids, context=context):
-            if re.match('^[0-9]+$', branch.branch_name):
-                r[branch.id] = "https://%s/pull/%s" % (branch.repo_id.base, branch.branch_name)
+    @api.multi
+    @api.depends('name')
+    def _compute_branch_name(self):
+        for record in self:
+            record.branch_name = record.name.split('/')[-1]
+
+    branch_url = fields.Chard(compute='_compute_branch_url', string='Branch url')
+
+    @api.multi
+    @api.depends('repo_id.base', 'branch_name')
+    def _compute_branch_url(self):
+        for record in self:
+            if re.match('^[0-9]+$', record.branch_name):
+                record.branch_url = "https://%s/pull/%s" % (record.repo_id.base, record.branch_name)
             else:
-                r[branch.id] = "https://%s/tree/%s" % (branch.repo_id.base, branch.branch_name)
-        return r
+                record.branch_url = "https://%s/tree/%s" % (record.repo_id.base, record.branch_name)
 
-    _columns = {
-        'repo_id': fields.many2one('runbot.repo', 'Repository', required=True, ondelete='cascade', select=1),
-        'name': fields.char('Ref Name', required=True),
-        'branch_name': fields.function(_get_branch_name, type='char', string='Branch', readonly=1, store=True),
-        'branch_url': fields.function(_get_branch_url, type='char', string='Branch url', readonly=1),
-        'pull_head_name': fields.function(_get_pull_head_name, type='char', string='PR HEAD name', readonly=1, store=True),
-        'sticky': fields.boolean('Sticky', select=1),
-        'coverage': fields.boolean('Coverage'),
-        'state': fields.char('Status'),
-        'modules': fields.char("Modules to Install", help="Comma-separated list of modules to install and test."),
-        'job_timeout': fields.integer('Job Timeout (minutes)', help='For default timeout: Mark it zero'),
-    }
+    pull_head_name = fields.Char(compute='_compute_pull_head_name', string='PR HEAD name', store=True)
 
-    def _get_pull_info(self, cr, uid, ids, context=None):
-        assert len(ids) == 1
-        branch = self.browse(cr, uid, ids[0], context=context)
-        repo = branch.repo_id
-        if repo.token and branch.name.startswith('refs/pull/'):
-            pull_number = branch.name[len('refs/pull/'):]
-            return repo.github('/repos/:owner/:repo/pulls/%s' % pull_number, ignore_errors=True) or {}
-        return {}
+    @api.multi
+    @api.depends('repo_id', 'repo_id.token', 'name')
+    def _compute_pull_head_name(self):
+        for record in self:
+            repo = record.repo_id
+            if repo.token and record.name.startswith('refs/pull/'):
+                pull_number = record.name[len('refs/pull/'):]
+            pi = repo.github('/repos/:owner/:repo/pulls/%s' % pull_number, ignore_errors=True) or {}
+            if pi:
+                record.pull_head_name = pi['head']['ref']
 
-    def _is_on_remote(self, cr, uid, ids, context=None):
-        # check that a branch still exists on remote
-        assert len(ids) == 1
-        branch = self.browse(cr, uid, ids[0], context=context)
-        repo = branch.repo_id
+    sticky = fields.Boolean('Sticky', index=True)
+    coverage = fields.Boolean('Coverage')
+    state = fields.Char('Status')
+    modules = fields.Char("Modules to Install", help="Comma-separated list of modules to install and test.")
+    job_timeout = fields.Integer('Job Timeout (minutes)', default=30, help='For default timeout: Mark it zero')
+
+    @api.multi
+    def is_on_remote(self):
+        ''' check that a branch still exists on remote '''
+        self.ensure_one()
+        repo = self.repo_id
         try:
             repo.git(['ls-remote', '-q', '--exit-code', repo.name, branch.name])
         except subprocess.CalledProcessError:
@@ -506,8 +497,8 @@ class runbot_branch(osv.osv):
         return True
 
 
-class runbot_build(osv.osv):
-    _name = "runbot.build"
+class RunbotBuild(models.Model):
+    _name = 'runbot.build'
     _order = 'id desc'
 
     def _get_dest(self, cr, uid, ids, field_name, arg, context=None):
@@ -625,7 +616,7 @@ class runbot_build(osv.osv):
             _logger.debug(*l)
 
     def list_jobs(self):
-        return sorted(job for job in dir(self) if _re_job.match(job))
+        return sorted(job for job in dir(self) if _RE_JOB.match(job))
 
     def find_port(self, cr, uid):
         # currently used port
@@ -991,9 +982,9 @@ class runbot_build(osv.osv):
             'job_end': time.strftime(openerp.tools.DEFAULT_SERVER_DATETIME_FORMAT, log_time),
         }
         if grep(log_all, ".modules.loading: Modules loaded."):
-            if rfind(log_all, _re_error):
+            if rfind(log_all, _RE_ERROR):
                 v['result'] = "ko"
-            elif rfind(log_all, _re_warning):
+            elif rfind(log_all, _RE_WARNING):
                 v['result'] = "warn"
             elif not grep(build.server("test/common.py"), "post_install") or grep(log_all, "Initiating shutdown."):
                 v['result'] = "ok"
@@ -1212,15 +1203,6 @@ class runbot_build(osv.osv):
             'line': '0',
         }, context=context)
 
-class runbot_event(osv.osv):
-    _inherit = 'ir.logging'
-    _order = 'id'
-
-    TYPES = [(t, t.capitalize()) for t in 'client server runbot'.split()]
-    _columns = {
-        'build_id': fields.many2one('runbot.build', 'Build'),
-        'type': fields.selection(TYPES, string='Type', required=True, select=True),
-    }
 
 # kill ` ps faux | grep ./static  | awk '{print $2}' `
 # ps faux| grep Cron | grep -- '-all'  | awk '{print $2}' | xargs kill

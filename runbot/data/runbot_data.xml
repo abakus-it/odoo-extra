@@ -1,13 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<openerp>
-  <data>
+<odoo>
     <record model="ir.module.category" id="module_category">
-      <field name="name">Runbot</field>
+        <field name="name">Runbot</field>
     </record>
-  </data>
 
 <data noupdate="1">
-    <!-- Cron -->
     <record model="ir.cron" id="repo_cron">
         <field name='name'>Runbot Cron</field>
         <field name='interval_number'>1</field>
@@ -15,10 +12,8 @@
         <field name="numbercall">-1</field>
         <field name="doall" eval="False" />
         <field name="model">runbot.repo</field>
-        <field name="function">cron</field>
+        <field name="function">_cron_repository</field>
         <field name="args">()</field>
     </record>
 </data>
-
-
-</openerp>
+</odoo>

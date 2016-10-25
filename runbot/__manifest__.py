@@ -3,9 +3,9 @@
     'name': 'Runbot',
     'category': 'Website',
     'summary': 'Runbot',
-    'version': '1.2',
+    'version': '1.3',
     'description': "Runbot",
-    'author': 'OpenERP SA',
+    'author': 'Odoo S.A.',
     'depends': ['website'],
     'external_dependencies': {
         'python': ['matplotlib'],
