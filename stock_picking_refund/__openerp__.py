@@ -10,7 +10,7 @@ This allows to decrease the quantity delivered in the
 associated SO, and therefore to generate refunds more easily.
 ==============================================================
 """,
-    'depends': ['sale_stock'],
+    'depends': ['sale_stock', 'purchase'],
     'data': [
         'security/ir.model.access.csv',
         'views/sale_stock_view.xml',
